@@ -50,3 +50,15 @@ coverage/
 *.temp
 tmp/
 temp/
+
+# Model files
+models/
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+gpt-oss-20b/
+
+# Hugging Face cache
+huggingface/
+.cache/transformers/
