@@ -1,24 +1,136 @@
 #!/usr/bin/env python3
 """
-FastAPI server for GPT-OSS-20B model
-Provides REST API endpoints for interacting with the model via Ollama
+Local LLM API Server
+OpenAI-compatible REST API for running GPT-OSS-20B locally via Ollama.
+
+This server provides drop-in compatible endpoints with the OpenAI API,
+allowing you to use local LLMs with existing OpenAI client libraries.
+
+GPT-OSS-20B: OpenAI's open-weight model (21B params, 3.6B active, MoE architecture)
+- Apache 2.0 license
+- MXFP4 quantization (fits in 16GB RAM)
+- Full chain-of-thought reasoning
+- Agentic capabilities (function calling, tool use)
+
+See: https://huggingface.co/openai/gpt-oss-20b
 """
 
-import asyncio
 import json
-import subprocess
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+# Configuration via environment variables
+DEFAULT_MODEL = os.getenv("LOCAL_LLM_MODEL", "gpt-oss:20b")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+
+# HTTP client for Ollama API
+http_client: Optional[httpx.AsyncClient] = None
+
+
+def check_ollama_server() -> bool:
+    """Check if Ollama server is running via HTTP."""
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            response = client.get(f"{OLLAMA_HOST}/api/tags")
+            return response.status_code == 200
+    except Exception:
+        return False
+
+
+def check_model_available() -> bool:
+    """Check if the configured model is available in Ollama."""
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(f"{OLLAMA_HOST}/api/tags")
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                model_names = [m.get("name", "") for m in models]
+                return any(DEFAULT_MODEL in name for name in model_names)
+    except Exception:
+        pass
+    return False
+
+
+def get_available_models() -> List[str]:
+    """Get list of available models from Ollama."""
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(f"{OLLAMA_HOST}/api/tags")
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                return [m.get("name", "") for m in models]
+    except Exception:
+        pass
+    return []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for startup/shutdown events."""
+    global http_client
+
+    # Startup
+    http_client = httpx.AsyncClient(timeout=120.0)
+
+    print("=" * 60)
+    print("Local LLM API Server Starting...")
+    print("=" * 60)
+
+    if not check_ollama_server():
+        print(f"\nWARNING: Ollama server is not running at {OLLAMA_HOST}")
+        print("Please run 'ollama serve' or set OLLAMA_HOST environment variable\n")
+    else:
+        print(f"Ollama server: Connected at {OLLAMA_HOST}")
+
+    if not check_model_available():
+        print(f"\nWARNING: Model '{DEFAULT_MODEL}' not found!")
+        print(f"Please run 'ollama pull {DEFAULT_MODEL}' to download the model")
+        print(f"Available models: {get_available_models()}\n")
+    else:
+        print(f"Model: {DEFAULT_MODEL} (ready)")
+
+    print(f"\nAPI Server: http://{API_HOST}:{API_PORT}")
+    print(f"API Docs: http://{API_HOST}:{API_PORT}/docs")
+    print("=" * 60)
+
+    yield
+
+    # Shutdown
+    if http_client:
+        await http_client.aclose()
+
+
 app = FastAPI(
-    title="GPT-OSS-20B API",
-    description="REST API for interacting with GPT-OSS-20B model through Ollama",
-    version="1.0.0",
+    title="Local LLM API",
+    description="""
+OpenAI-compatible REST API for running GPT-OSS-20B locally via Ollama.
+
+## Features
+- Drop-in replacement for OpenAI API
+- Chat completions with streaming support
+- Text completions
+- Health monitoring
+
+## Model Info
+GPT-OSS-20B is OpenAI's open-weight model:
+- 21B total parameters, 3.6B active (MoE)
+- Apache 2.0 license
+- MXFP4 quantization (16GB RAM)
+- Chain-of-thought reasoning
+    """,
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for web clients
@@ -31,7 +143,7 @@ app.add_middleware(
 )
 
 
-# Request/Response models
+# Request/Response models (OpenAI-compatible)
 class ChatMessage(BaseModel):
     role: str = Field(..., description="Message role: 'user', 'assistant', or 'system'")
     content: str = Field(..., description="Message content")
@@ -39,16 +151,18 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., description="List of chat messages")
-    model: str = Field(default="gpt-oss:20b", description="Model to use")
+    model: str = Field(default=DEFAULT_MODEL, description="Model to use")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
     max_tokens: Optional[int] = Field(
-        default=256, ge=1, le=4096, description="Maximum tokens to generate"
+        default=2048, ge=1, le=32768, description="Maximum tokens to generate"
     )
     stream: bool = Field(default=False, description="Stream the response")
+    top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0, description="Top-p sampling")
 
 
 class ChatResponse(BaseModel):
     id: str = Field(..., description="Unique response ID")
+    object: str = Field(default="chat.completion", description="Object type")
     model: str = Field(..., description="Model used")
     created: int = Field(..., description="Unix timestamp")
     choices: List[Dict[str, Any]] = Field(..., description="Response choices")
@@ -57,16 +171,17 @@ class ChatResponse(BaseModel):
 
 class CompletionRequest(BaseModel):
     prompt: str = Field(..., description="Input prompt")
-    model: str = Field(default="gpt-oss:20b", description="Model to use")
+    model: str = Field(default=DEFAULT_MODEL, description="Model to use")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
     max_tokens: Optional[int] = Field(
-        default=256, ge=1, le=4096, description="Maximum tokens to generate"
+        default=2048, ge=1, le=32768, description="Maximum tokens to generate"
     )
     stream: bool = Field(default=False, description="Stream the response")
 
 
 class CompletionResponse(BaseModel):
     id: str = Field(..., description="Unique response ID")
+    object: str = Field(default="text_completion", description="Object type")
     model: str = Field(..., description="Model used")
     created: int = Field(..., description="Unix timestamp")
     choices: List[Dict[str, Any]] = Field(..., description="Response choices")
@@ -80,207 +195,337 @@ class ModelInfo(BaseModel):
     owned_by: str = Field(default="openai", description="Model owner")
 
 
-def check_ollama_server():
-    """Check if Ollama server is running"""
-    try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=2)
-        return result.returncode == 0
-    except:
-        return False
+async def generate_ollama_response(
+    prompt: str,
+    model: str,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    stream: bool = False,
+) -> AsyncGenerator[str, None] | str:
+    """Generate response from Ollama API."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": stream,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        },
+    }
 
-
-def check_model_available():
-    """Check if GPT-OSS-20B model is available"""
-    try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-        return "gpt-oss:20b" in result.stdout
-    except:
-        return False
-
-
-async def run_ollama_generate(
-    prompt: str, model: str = "gpt-oss:20b", temperature: float = 0.7, max_tokens: int = 256
-):
-    """Run Ollama generate command asynchronously"""
-    cmd = ["ollama", "run", model, "--verbose", prompt]
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    if stream:
+        async def stream_response():
+            async with http_client.stream(
+                "POST",
+                f"{OLLAMA_HOST}/api/generate",
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail="Ollama API error"
+                    )
+                async for line in response.aiter_lines():
+                    if line:
+                        data = json.loads(line)
+                        if "response" in data:
+                            yield data["response"]
+        return stream_response()
+    else:
+        response = await http_client.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json=payload,
         )
-
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Model error: {stderr.decode()}")
-
-        return stdout.decode().strip()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Ollama API error: {response.text}"
+            )
+        data = response.json()
+        return data.get("response", "")
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Check requirements on startup"""
-    if not check_ollama_server():
-        print("WARNING: Ollama server is not running!")
-        print("Please run 'ollama serve' in a separate terminal")
+async def generate_chat_response(
+    messages: List[ChatMessage],
+    model: str,
+    temperature: float = 0.7,
+    max_tokens: int = 2048,
+    stream: bool = False,
+) -> AsyncGenerator[str, None] | str:
+    """Generate chat response from Ollama API using chat endpoint."""
+    payload = {
+        "model": model,
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+        "stream": stream,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        },
+    }
 
-    if not check_model_available():
-        print("WARNING: GPT-OSS-20B model not found!")
-        print("Please run 'ollama pull gpt-oss:20b' to download the model")
+    if stream:
+        async def stream_response():
+            async with http_client.stream(
+                "POST",
+                f"{OLLAMA_HOST}/api/chat",
+                json=payload,
+            ) as response:
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail="Ollama API error"
+                    )
+                async for line in response.aiter_lines():
+                    if line:
+                        data = json.loads(line)
+                        if "message" in data and "content" in data["message"]:
+                            yield data["message"]["content"]
+        return stream_response()
+    else:
+        response = await http_client.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=payload,
+        )
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Ollama API error: {response.text}"
+            )
+        data = response.json()
+        return data.get("message", {}).get("content", "")
 
 
 @app.get("/")
 async def root():
-    """API root endpoint"""
+    """API root endpoint with service information."""
     return {
-        "message": "GPT-OSS-20B API Server",
-        "version": "1.0.0",
+        "service": "Local LLM API",
+        "version": "2.0.0",
+        "model": DEFAULT_MODEL,
+        "description": "OpenAI-compatible API for GPT-OSS-20B via Ollama",
         "endpoints": {
             "chat": "/v1/chat/completions",
-            "completion": "/v1/completions",
+            "completions": "/v1/completions",
             "models": "/v1/models",
             "health": "/health",
         },
+        "docs": "/docs",
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint."""
     ollama_running = check_ollama_server()
     model_available = check_model_available()
+    available_models = get_available_models() if ollama_running else []
 
-    status = "healthy" if (ollama_running and model_available) else "unhealthy"
+    status = "healthy" if (ollama_running and model_available) else "degraded"
+    if not ollama_running:
+        status = "unhealthy"
 
     return {
         "status": status,
         "ollama_server": ollama_running,
+        "ollama_host": OLLAMA_HOST,
         "model_available": model_available,
-        "timestamp": datetime.utcnow().isoformat(),
+        "configured_model": DEFAULT_MODEL,
+        "available_models": available_models,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models (OpenAI-compatible endpoint)"""
+    """List available models (OpenAI-compatible endpoint)."""
     models = []
+    available = get_available_models()
 
-    if check_model_available():
-        models.append(ModelInfo(id="gpt-oss:20b", created=int(datetime.utcnow().timestamp())))
+    for model_name in available:
+        models.append(
+            ModelInfo(
+                id=model_name,
+                created=int(datetime.now(timezone.utc).timestamp()),
+                owned_by="local" if "gpt-oss" not in model_name else "openai",
+            )
+        )
 
     return {"data": models, "object": "list"}
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
-    """Chat completions endpoint (OpenAI-compatible)"""
+    """Chat completions endpoint (OpenAI-compatible)."""
     if not check_ollama_server():
-        raise HTTPException(status_code=503, detail="Ollama server is not running")
-
-    if not check_model_available():
         raise HTTPException(
-            status_code=404, detail="Model not found. Run 'ollama pull gpt-oss:20b'"
+            status_code=503,
+            detail=f"Ollama server is not running at {OLLAMA_HOST}"
         )
 
-    # Build conversation prompt from messages
-    prompt = ""
-    for msg in request.messages:
-        if msg.role == "system":
-            prompt += f"System: {msg.content}\n"
-        elif msg.role == "user":
-            prompt += f"User: {msg.content}\n"
-        elif msg.role == "assistant":
-            prompt += f"Assistant: {msg.content}\n"
+    now = datetime.now(timezone.utc)
+    response_id = f"chatcmpl-{int(now.timestamp())}"
 
-    prompt += "Assistant: "
+    if request.stream:
+        async def stream_sse():
+            response_gen = await generate_chat_response(
+                messages=request.messages,
+                model=request.model,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens or 2048,
+                stream=True,
+            )
+            async for chunk in response_gen:
+                data = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(now.timestamp()),
+                    "model": request.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
 
-    # Generate response
-    response_text = await run_ollama_generate(
-        prompt=prompt,
+            # Send final chunk
+            final_data = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": int(now.timestamp()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(final_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # Non-streaming response
+    response_text = await generate_chat_response(
+        messages=request.messages,
         model=request.model,
         temperature=request.temperature,
-        max_tokens=request.max_tokens or 256,
+        max_tokens=request.max_tokens or 2048,
+        stream=False,
     )
 
-    # Format response in OpenAI-compatible format
-    response = ChatResponse(
-        id=f"chatcmpl-{int(datetime.utcnow().timestamp())}",
+    # Estimate token counts (approximate)
+    prompt_text = " ".join(m.content for m in request.messages)
+    prompt_tokens = len(prompt_text.split())
+    completion_tokens = len(response_text.split())
+
+    return ChatResponse(
+        id=response_id,
         model=request.model,
-        created=int(datetime.utcnow().timestamp()),
-        choices=[
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": response_text},
-                "finish_reason": "stop",
-            }
-        ],
+        created=int(now.timestamp()),
+        choices=[{
+            "index": 0,
+            "message": {"role": "assistant", "content": response_text},
+            "finish_reason": "stop",
+        }],
         usage={
-            "prompt_tokens": len(prompt.split()),
-            "completion_tokens": len(response_text.split()),
-            "total_tokens": len(prompt.split()) + len(response_text.split()),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     )
-
-    return response
 
 
 @app.post("/v1/completions")
 async def completions(request: CompletionRequest):
-    """Text completions endpoint (OpenAI-compatible)"""
+    """Text completions endpoint (OpenAI-compatible)."""
     if not check_ollama_server():
-        raise HTTPException(status_code=503, detail="Ollama server is not running")
-
-    if not check_model_available():
         raise HTTPException(
-            status_code=404, detail="Model not found. Run 'ollama pull gpt-oss:20b'"
+            status_code=503,
+            detail=f"Ollama server is not running at {OLLAMA_HOST}"
         )
 
-    # Generate response
-    response_text = await run_ollama_generate(
+    now = datetime.now(timezone.utc)
+    response_id = f"cmpl-{int(now.timestamp())}"
+
+    if request.stream:
+        async def stream_sse():
+            response_gen = await generate_ollama_response(
+                prompt=request.prompt,
+                model=request.model,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens or 2048,
+                stream=True,
+            )
+            async for chunk in response_gen:
+                data = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(now.timestamp()),
+                    "model": request.model,
+                    "choices": [{
+                        "index": 0,
+                        "text": chunk,
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # Non-streaming response
+    response_text = await generate_ollama_response(
         prompt=request.prompt,
         model=request.model,
         temperature=request.temperature,
-        max_tokens=request.max_tokens or 256,
+        max_tokens=request.max_tokens or 2048,
+        stream=False,
     )
 
-    # Format response in OpenAI-compatible format
-    response = CompletionResponse(
-        id=f"cmpl-{int(datetime.utcnow().timestamp())}",
+    prompt_tokens = len(request.prompt.split())
+    completion_tokens = len(response_text.split())
+
+    return CompletionResponse(
+        id=response_id,
         model=request.model,
-        created=int(datetime.utcnow().timestamp()),
-        choices=[{"index": 0, "text": response_text, "finish_reason": "stop"}],
+        created=int(now.timestamp()),
+        choices=[{
+            "index": 0,
+            "text": response_text,
+            "finish_reason": "stop",
+        }],
         usage={
-            "prompt_tokens": len(request.prompt.split()),
-            "completion_tokens": len(response_text.split()),
-            "total_tokens": len(request.prompt.split()) + len(response_text.split()),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     )
 
-    return response
-
 
 def main():
-    """Main function to run the API server"""
-    print("Starting GPT-OSS-20B API Server...")
-    print("=" * 50)
-
-    # Check requirements
-    if not check_ollama_server():
-        print("\n⚠️  WARNING: Ollama server is not running!")
-        print("Please run 'ollama serve' in a separate terminal\n")
-
-    if not check_model_available():
-        print("\n⚠️  WARNING: GPT-OSS-20B model not found!")
-        print("Please run 'ollama pull gpt-oss:20b' to download the model\n")
-
-    print("API Server starting at: http://localhost:8000")
-    print("Interactive docs at: http://localhost:8000/docs")
-    print("=" * 50)
-
-    # Run the server
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    """Main function to run the API server."""
+    uvicorn.run(
+        app,
+        host=API_HOST,
+        port=API_PORT,
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":
